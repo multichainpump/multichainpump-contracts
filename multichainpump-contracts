@@ -1,0 +1,498 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title BondingCurveToken
+ * @notice ERC-20 token with pump.fun-style bonding curve for price discovery
+ * @dev Implements constant product AMM formula with 0.95% platform fee on all trades
+ * 
+ * Bonding Curve Formula:
+ * - Uses virtual reserves for initial liquidity
+ * - Price = virtualEthReserve / virtualTokenReserve
+ * - Buy: tokens_out = tokenReserve - (tokenReserve * ethReserve) / (ethReserve + ethIn)
+ * - Sell: eth_out = ethReserve - (tokenReserve * ethReserve) / (tokenReserve + tokensIn)
+ * 
+ * Graduation:
+ * - When market cap reaches threshold, token graduates
+ * - Post-graduation, users can redeem tokens for pro-rata share of ETH reserves
+ * - Redemption price = realEthReserve / circulatingSupply (fair for all holders)
+ */
+contract BondingCurveToken {
+    string public name;
+    string public symbol;
+    uint8 public constant decimals = 18;
+    uint256 public totalSupply;
+    
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    
+    // Bonding curve state
+    uint256 public virtualTokenReserve;
+    uint256 public virtualEthReserve;
+    uint256 public realTokenReserve;
+    uint256 public realEthReserve;
+    uint256 public tokensSold;
+    
+    // Constant product invariant (k = virtualToken * virtualEth)
+    uint256 private invariantK;
+    
+    // Platform fee configuration (95 = 0.95%)
+    uint256 public constant PLATFORM_FEE_BPS = 95;
+    uint256 public constant BPS_DENOMINATOR = 10000;
+    address public immutable platformWallet;
+    address public immutable creator;
+    
+    // Fixed supply: 1 billion tokens
+    uint256 public constant TOTAL_SUPPLY = 1_000_000_000 * 10**18;
+    
+    // Token distribution percentages (basis points: 100 = 1%)
+    uint256 public constant PLATFORM_ALLOCATION_BPS = 150; // 1.5% to platform
+    uint256 public constant CREATOR_ALLOCATION_BPS = 100;  // 1% to creator (dev)
+    // Remaining 97.5% goes to bonding curve for community trading
+    
+    // Initial virtual reserves for price discovery (pump.fun style)
+    // 800M tokens available for trading, 8 ETH virtual liquidity
+    uint256 public constant INITIAL_VIRTUAL_TOKEN_RESERVE = 800_000_000 * 10**18;
+    uint256 public constant INITIAL_VIRTUAL_ETH_RESERVE = 8 * 10**18;
+    
+    // Graduation threshold - pump.fun style (~$69K market cap)
+    // Passed in constructor to support different chains with different native token prices
+    // Example: 20 ETH, 106 BNB, 1725 AVAX all equal ~$69K
+    uint256 public immutable graduationThreshold;
+    bool public graduated;
+    uint256 public graduationMarginalPrice; // Marginal price at graduation (for display)
+    
+    // Reentrancy guard
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+    uint256 private _status;
+    
+    // Events
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event TokensPurchased(
+        address indexed buyer,
+        uint256 ethAmount,
+        uint256 tokenAmount,
+        uint256 fee,
+        uint256 newPrice
+    );
+    event TokensSold(
+        address indexed seller,
+        uint256 tokenAmount,
+        uint256 ethAmount,
+        uint256 fee,
+        uint256 newPrice
+    );
+    event TokensRedeemed(
+        address indexed redeemer,
+        uint256 tokenAmount,
+        uint256 ethAmount,
+        uint256 redemptionPrice
+    );
+    event Graduated(uint256 finalMarginalPrice, uint256 totalEthRaised, uint256 circulatingSupply);
+    
+    modifier nonReentrant() {
+        require(_status != ENTERED, "ReentrancyGuard: reentrant call");
+        _status = ENTERED;
+        _;
+        _status = NOT_ENTERED;
+    }
+    
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        address _platformWallet,
+        uint256 _graduationThreshold
+    ) {
+        require(_platformWallet != address(0), "Invalid platform wallet");
+        require(_graduationThreshold > 0, "Invalid graduation threshold");
+        
+        name = _name;
+        symbol = _symbol;
+        platformWallet = _platformWallet;
+        graduationThreshold = _graduationThreshold;
+        creator = msg.sender;
+        _status = NOT_ENTERED;
+        
+        // Initialize total supply
+        totalSupply = TOTAL_SUPPLY;
+        
+        // Calculate token allocations
+        uint256 platformAllocation = (TOTAL_SUPPLY * PLATFORM_ALLOCATION_BPS) / BPS_DENOMINATOR; // 1.5% = 15M tokens
+        uint256 creatorAllocation = (TOTAL_SUPPLY * CREATOR_ALLOCATION_BPS) / BPS_DENOMINATOR;   // 1% = 10M tokens
+        uint256 bondingCurveAllocation = TOTAL_SUPPLY - platformAllocation - creatorAllocation;  // 97.5% = 975M tokens
+        
+        // Distribute tokens
+        balanceOf[platformWallet] = platformAllocation;
+        balanceOf[creator] = creatorAllocation;
+        balanceOf[address(this)] = bondingCurveAllocation;
+        
+        // Initialize bonding curve with remaining tokens
+        realTokenReserve = bondingCurveAllocation;
+        
+        // Initialize virtual reserves for bonding curve price discovery
+        virtualTokenReserve = INITIAL_VIRTUAL_TOKEN_RESERVE;
+        virtualEthReserve = INITIAL_VIRTUAL_ETH_RESERVE;
+        
+        // Store initial invariant
+        invariantK = INITIAL_VIRTUAL_TOKEN_RESERVE * INITIAL_VIRTUAL_ETH_RESERVE;
+        
+        // Emit transfer events
+        emit Transfer(address(0), platformWallet, platformAllocation);
+        emit Transfer(address(0), creator, creatorAllocation);
+        emit Transfer(address(0), address(this), bondingCurveAllocation);
+    }
+    
+    // ============ ERC-20 Functions ============
+    
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+    
+    function transfer(address to, uint256 amount) external returns (bool) {
+        return _transfer(msg.sender, to, amount);
+    }
+    
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 currentAllowance = allowance[from][msg.sender];
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "Insufficient allowance");
+            allowance[from][msg.sender] = currentAllowance - amount;
+        }
+        return _transfer(from, to, amount);
+    }
+    
+    function _transfer(address from, address to, uint256 amount) internal returns (bool) {
+        require(from != address(0), "Transfer from zero address");
+        require(to != address(0), "Transfer to zero address");
+        require(balanceOf[from] >= amount, "Insufficient balance");
+        
+        // Prevent direct transfers to contract - must use sell() or redeem()
+        require(to != address(this), "Use sell() or redeem() to return tokens");
+        
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        
+        emit Transfer(from, to, amount);
+        return true;
+    }
+    
+    // ============ Bonding Curve Functions ============
+    
+    /**
+     * @notice Buy tokens with ETH using bonding curve
+     * @return tokenAmount The amount of tokens purchased
+     */
+    function buy() external payable nonReentrant returns (uint256 tokenAmount) {
+        require(msg.value > 0, "Must send ETH");
+        require(!graduated, "Token graduated - use DEX");
+        
+        // Calculate and deduct platform fee (0.95%)
+        uint256 fee = (msg.value * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
+        uint256 ethAfterFee = msg.value - fee;
+        
+        // Calculate tokens to receive using constant product formula
+        uint256 newVirtualEthReserve = virtualEthReserve + ethAfterFee;
+        uint256 newVirtualTokenReserve = invariantK / newVirtualEthReserve;
+        tokenAmount = virtualTokenReserve - newVirtualTokenReserve;
+        
+        require(tokenAmount > 0, "Insufficient output amount");
+        require(tokenAmount <= realTokenReserve, "Insufficient token liquidity");
+        
+        // Update reserves
+        virtualTokenReserve = newVirtualTokenReserve;
+        virtualEthReserve = newVirtualEthReserve;
+        realTokenReserve -= tokenAmount;
+        realEthReserve += ethAfterFee;
+        tokensSold += tokenAmount;
+        
+        // Transfer tokens to buyer
+        balanceOf[address(this)] -= tokenAmount;
+        balanceOf[msg.sender] += tokenAmount;
+        
+        // Send fee to platform
+        if (fee > 0) {
+            (bool feeSuccess, ) = platformWallet.call{value: fee}("");
+            require(feeSuccess, "Fee transfer failed");
+        }
+        
+        uint256 newPrice = getCurrentPrice();
+        emit Transfer(address(this), msg.sender, tokenAmount);
+        emit TokensPurchased(msg.sender, msg.value, tokenAmount, fee, newPrice);
+        
+        // Check for graduation
+        _checkGraduation();
+        
+        return tokenAmount;
+    }
+    
+    /**
+     * @notice Sell tokens for ETH using bonding curve
+     * @param tokenAmount The amount of tokens to sell
+     * @return ethAmount The amount of ETH received (after fee)
+     */
+    function sell(uint256 tokenAmount) external nonReentrant returns (uint256 ethAmount) {
+        require(tokenAmount > 0, "Must sell tokens");
+        require(balanceOf[msg.sender] >= tokenAmount, "Insufficient balance");
+        
+        // If graduated, use pro-rata redemption
+        if (graduated) {
+            return _redeemProRata(tokenAmount);
+        }
+        
+        // Calculate ETH to receive using constant product formula
+        uint256 newVirtualTokenReserve = virtualTokenReserve + tokenAmount;
+        uint256 newVirtualEthReserve = invariantK / newVirtualTokenReserve;
+        uint256 ethBeforeFee = virtualEthReserve - newVirtualEthReserve;
+        
+        require(ethBeforeFee <= realEthReserve, "Insufficient ETH liquidity");
+        
+        // Calculate and deduct platform fee (0.95%)
+        uint256 fee = (ethBeforeFee * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
+        ethAmount = ethBeforeFee - fee;
+        
+        require(ethAmount > 0, "Insufficient output amount");
+        
+        // Update reserves
+        virtualTokenReserve = newVirtualTokenReserve;
+        virtualEthReserve = newVirtualEthReserve;
+        realTokenReserve += tokenAmount;
+        realEthReserve -= ethBeforeFee;
+        tokensSold -= tokenAmount;
+        
+        // Transfer tokens from seller to contract
+        balanceOf[msg.sender] -= tokenAmount;
+        balanceOf[address(this)] += tokenAmount;
+        
+        // Send ETH to seller
+        (bool success, ) = msg.sender.call{value: ethAmount}("");
+        require(success, "ETH transfer failed");
+        
+        // Send fee to platform
+        if (fee > 0) {
+            (bool feeSuccess, ) = platformWallet.call{value: fee}("");
+            require(feeSuccess, "Fee transfer failed");
+        }
+        
+        uint256 newPrice = getCurrentPrice();
+        emit Transfer(msg.sender, address(this), tokenAmount);
+        emit TokensSold(msg.sender, tokenAmount, ethAmount, fee, newPrice);
+        
+        return ethAmount;
+    }
+    
+    /**
+     * @notice Redeem tokens for pro-rata share of ETH (post-graduation only)
+     * @dev Uses fair pro-rata pricing so all holders can exit
+     * @param tokenAmount Amount of tokens to redeem
+     * @return ethAmount ETH received
+     */
+    function redeem(uint256 tokenAmount) external nonReentrant returns (uint256 ethAmount) {
+        require(graduated, "Not graduated yet - use sell()");
+        require(tokenAmount > 0, "Must redeem tokens");
+        require(balanceOf[msg.sender] >= tokenAmount, "Insufficient balance");
+        
+        return _redeemProRata(tokenAmount);
+    }
+    
+    /**
+     * @notice Internal pro-rata redemption (fair for all holders)
+     * @dev redemptionPrice = realEthReserve / circulatingSupply
+     *      This ensures ALL holders can redeem, not just early callers
+     */
+    function _redeemProRata(uint256 tokenAmount) internal returns (uint256 ethAmount) {
+        // Calculate circulating supply (tokens not in contract)
+        uint256 circulatingSupply = totalSupply - balanceOf[address(this)];
+        require(circulatingSupply > 0, "No circulating supply");
+        
+        // Pro-rata share of ETH reserves
+        // ethAmount = (tokenAmount / circulatingSupply) * realEthReserve
+        ethAmount = (tokenAmount * realEthReserve) / circulatingSupply;
+        
+        // Apply platform fee
+        uint256 fee = (ethAmount * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
+        uint256 ethAfterFee = ethAmount - fee;
+        
+        require(ethAfterFee > 0, "Insufficient output");
+        
+        // Update reserves
+        realEthReserve -= ethAmount; // Deduct full amount (including fee)
+        
+        // Transfer tokens back to contract
+        balanceOf[msg.sender] -= tokenAmount;
+        balanceOf[address(this)] += tokenAmount;
+        
+        // Calculate redemption price for event (before fee)
+        uint256 redemptionPrice = (realEthReserve * 1e18) / circulatingSupply;
+        
+        // Send ETH to redeemer
+        (bool success, ) = msg.sender.call{value: ethAfterFee}("");
+        require(success, "ETH transfer failed");
+        
+        // Send fee to platform
+        if (fee > 0) {
+            (bool feeSuccess, ) = platformWallet.call{value: fee}("");
+            require(feeSuccess, "Fee transfer failed");
+        }
+        
+        emit Transfer(msg.sender, address(this), tokenAmount);
+        emit TokensRedeemed(msg.sender, tokenAmount, ethAfterFee, redemptionPrice);
+        
+        return ethAfterFee;
+    }
+    
+    // ============ View Functions ============
+    
+    /**
+     * @notice Get current token price in ETH (wei per token)
+     */
+    function getCurrentPrice() public view returns (uint256) {
+        if (virtualTokenReserve == 0) return 0;
+        return (virtualEthReserve * 1e18) / virtualTokenReserve;
+    }
+    
+    /**
+     * @notice Get current market cap in ETH (wei)
+     */
+    function getMarketCap() public view returns (uint256) {
+        return (getCurrentPrice() * totalSupply) / 1e18;
+    }
+    
+    /**
+     * @notice Get pro-rata redemption price (post-graduation)
+     * @dev Returns the ETH amount each token can be redeemed for
+     */
+    function getRedemptionPrice() public view returns (uint256) {
+        uint256 circulatingSupply = totalSupply - balanceOf[address(this)];
+        if (circulatingSupply == 0 || realEthReserve == 0) return 0;
+        return (realEthReserve * 1e18) / circulatingSupply;
+    }
+    
+    /**
+     * @notice Calculate tokens received for a given ETH amount
+     */
+    function calculateBuyReturn(uint256 ethAmount) external view returns (uint256) {
+        if (ethAmount == 0 || graduated) return 0;
+        
+        uint256 fee = (ethAmount * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
+        uint256 ethAfterFee = ethAmount - fee;
+        
+        uint256 newVirtualEthReserve = virtualEthReserve + ethAfterFee;
+        uint256 newVirtualTokenReserve = invariantK / newVirtualEthReserve;
+        uint256 tokenAmount = virtualTokenReserve - newVirtualTokenReserve;
+        
+        if (tokenAmount > realTokenReserve) {
+            return realTokenReserve;
+        }
+        return tokenAmount;
+    }
+    
+    /**
+     * @notice Calculate ETH received for a given token amount
+     */
+    function calculateSellReturn(uint256 tokenAmount) external view returns (uint256) {
+        if (tokenAmount == 0) return 0;
+        
+        // If graduated, calculate pro-rata redemption
+        if (graduated) {
+            uint256 circulatingSupply = totalSupply - balanceOf[address(this)];
+            if (circulatingSupply == 0) return 0;
+            
+            uint256 ethAmount = (tokenAmount * realEthReserve) / circulatingSupply;
+            uint256 fee = (ethAmount * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
+            return ethAmount - fee;
+        }
+        
+        uint256 newVirtualTokenReserve = virtualTokenReserve + tokenAmount;
+        uint256 newVirtualEthReserve = invariantK / newVirtualTokenReserve;
+        uint256 ethBeforeFee = virtualEthReserve - newVirtualEthReserve;
+        
+        if (ethBeforeFee > realEthReserve) {
+            ethBeforeFee = realEthReserve;
+        }
+        
+        uint256 fee = (ethBeforeFee * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
+        return ethBeforeFee - fee;
+    }
+    
+    /**
+     * @notice Get bonding curve state
+     */
+    function getCurveState() external view returns (
+        uint256 _virtualTokenReserve,
+        uint256 _virtualEthReserve,
+        uint256 _realTokenReserve,
+        uint256 _realEthReserve,
+        uint256 _tokensSold,
+        uint256 _currentPrice,
+        uint256 _marketCap,
+        bool _graduated
+    ) {
+        return (
+            virtualTokenReserve,
+            virtualEthReserve,
+            realTokenReserve,
+            realEthReserve,
+            tokensSold,
+            getCurrentPrice(),
+            getMarketCap(),
+            graduated
+        );
+    }
+    
+    /**
+     * @notice Get bonding curve progress (0-100%)
+     * @dev Based on real ETH collected vs graduation threshold
+     */
+    function getBondingProgress() external view returns (uint256) {
+        if (realEthReserve >= graduationThreshold) return 100;
+        return (realEthReserve * 100) / graduationThreshold;
+    }
+    
+    /**
+     * @notice Get the constant product invariant
+     */
+    function getInvariantK() external view returns (uint256) {
+        return invariantK;
+    }
+    
+    /**
+     * @notice Get circulating supply (tokens not in bonding curve)
+     */
+    function getCirculatingSupply() external view returns (uint256) {
+        return totalSupply - balanceOf[address(this)];
+    }
+    
+    // ============ Internal Functions ============
+    
+    function _checkGraduation() internal {
+        // Graduate when real ETH in curve reaches threshold (~$69K at current prices)
+        if (!graduated && realEthReserve >= graduationThreshold) {
+            graduated = true;
+            graduationMarginalPrice = getCurrentPrice();
+            uint256 circulatingSupply = totalSupply - balanceOf[address(this)];
+            emit Graduated(graduationMarginalPrice, realEthReserve, circulatingSupply);
+        }
+    }
+    
+    // ============ Emergency Functions ============
+    
+    /**
+     * @notice Allows creator to recover stuck ETH in emergency
+     */
+    function emergencyWithdraw() external {
+        require(msg.sender == creator, "Only creator");
+        uint256 excess = address(this).balance - realEthReserve;
+        if (excess > 0) {
+            (bool success, ) = creator.call{value: excess}("");
+            require(success, "Transfer failed");
+        }
+    }
+    
+    receive() external payable {
+        revert("Use buy() function");
+    }
+}
